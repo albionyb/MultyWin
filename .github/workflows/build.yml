@@ -1,0 +1,96 @@
+name: Build & Release APK
+
+# Repo only needs: MultiWin.zip + .github/workflows/build.yml
+# The zip is unpacked on the runner, so you never upload the extracted files.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "MultiWin.zip"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project from zip
+        run: |
+          test -f MultiWin.zip || { echo "::error::MultiWin.zip not found in repo root"; exit 1; }
+          unzip -q MultiWin.zip -d _src
+          SETTINGS=$(find _src -maxdepth 2 -name settings.gradle.kts | head -n 1)
+          test -n "$SETTINGS" || { echo "::error::settings.gradle.kts not found inside the zip"; exit 1; }
+          PROJECT_DIR=$(cd "$(dirname "$SETTINGS")" && pwd)
+          VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' "$PROJECT_DIR/app/build.gradle.kts")
+          test -n "$VERSION" || { echo "::error::versionName not found"; exit 1; }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Project: $PROJECT_DIR  Version: $VERSION"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          SECRET_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SECRET_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            echo "KEYSTORE_PASSWORD=$SECRET_STORE_PASS" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=$SECRET_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$SECRET_KEY_PASS" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No signing secrets found. Using a TEMPORARY key. This APK will not update over APKs signed with another key. Add the 4 secrets (see README)."
+            TMP_PASS=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)
+            keytool -genkeypair -keystore "$KS" -alias temp -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$TMP_PASS" -keypass "$TMP_PASS" -dname "CN=MultiWin temp"
+            echo "KEYSTORE_PASSWORD=$TMP_PASS" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=temp" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$TMP_PASS" >> "$GITHUB_ENV"
+          fi
+          echo "KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleRelease --no-daemon
+
+      - name: Verify APK (signed, not debuggable) and name it
+        run: |
+          APK=$(ls "$PROJECT_DIR"/app/build/outputs/apk/release/*.apk | head -n 1)
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          "$BT/apksigner" verify --print-certs "$APK"
+          if "$BT/aapt2" dump badging "$APK" | grep -q "application-debuggable"; then
+            echo "::error::APK is still debuggable"; exit 1
+          fi
+          cp "$APK" "MultiWin-v${VERSION}.apk"
+          echo "Built MultiWin-v${VERSION}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MultiWin-v${{ env.VERSION }}
+          path: MultiWin-v${{ env.VERSION }}.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: MultiWin v${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          files: MultiWin-v${{ env.VERSION }}.apk
+          generate_release_notes: true
+          make_latest: true
